@@ -90,7 +90,14 @@ pub fn install_at(
         return Err(format!("Cannot update {} to {}: installed version {} is newer", app.name, release.version_label(), inst_v));
     }
     log::info!("{}: starting {} to {} ({})", app.name, if existing.is_some() { "update" } else { "install" }, release.version_label(), kind.label());
-    let file = download(release, asset, job)?;
+    // Said before the download starts, so jobs started together (Update all) install together,
+    // behind one permission prompt, however long each download takes.
+    #[cfg(windows)]
+    let ticket = (kind == PackageKind::Msi).then(windows::ticket);
+    #[cfg(target_os = "linux")]
+    let ticket = linux::ticket(kind);
+    #[allow(unused_variables)]
+    let (file, sha256) = download_verified(release, asset, job)?;
     log::info!("{}: download ready ({}), running installer...", app.name, file.display());
     // Past this point the install can't be interrupted halfway.
     (job.phase)(JobPhase::Installing);
@@ -103,7 +110,13 @@ pub fn install_at(
                 .map(|path| Some(record(&version, kind, path, Vec::new(), false)))
         }
         #[cfg(windows)]
-        PackageKind::Msi => windows::run_msi(&file, destination.as_deref(), job.stop, &mut *job.phase).map(|_| None),
+        PackageKind::Msi => {
+            // Looked at again just before the permission prompt: the app may have been started
+            // while it downloaded.
+            let running = existing.filter(|inst| inst.source.launcher_can_update()).map(|inst| PathBuf::from(&inst.location));
+            let msi = windows::Msi { app: app.name.to_string(), file: &file, sha256: &sha256, destination: destination.as_deref(), running };
+            windows::run_msi(msi, job.stop, &mut *job.phase, ticket).map(|_| None)
+        }
         #[cfg(windows)]
         PackageKind::PortableZip => {
             crate::portable::install(app, &file, &version, previous, job.paths, destination.as_deref(), job.replace, &mut |record| {
@@ -119,7 +132,7 @@ pub fn install_at(
         }
         #[cfg(target_os = "linux")]
         PackageKind::Deb | PackageKind::Rpm | PackageKind::ArchPkg | PackageKind::Flatpak => {
-            linux::install_package(kind, &file, job.stop, &mut *job.phase).map(|_| None)
+            linux::install_package(kind, &file, job.stop, &mut *job.phase, ticket).map(|_| None)
         }
         #[cfg(target_os = "linux")]
         PackageKind::AppImage => {
@@ -266,7 +279,7 @@ fn selected_folder(folder: &str, writable: bool) -> Result<PathBuf, String> {
 }
 
 #[cfg(any(windows, test))]
-fn msi_folder_argument(path: &Path) -> Result<String, String> {
+pub(crate) fn msi_folder_argument(path: &Path) -> Result<String, String> {
     let value = path.to_str().ok_or("unusual characters in a path")?;
     if value.chars().any(|c| c == '"' || c.is_control()) {
         return Err(format!("couldn't use install folder {value}: the path contains invalid characters"));
@@ -366,6 +379,11 @@ pub fn available_kinds() -> Vec<PackageKind> {
 /// or GitHub's per-file digest, else the release's `SHA256SUMS.txt`. A release with neither is
 /// refused before anything is fetched: a file nothing vouches for is never installed (#90).
 pub(crate) fn download(release: &Release, asset: &Asset, job: &mut Job<'_>) -> Result<PathBuf, String> {
+    download_verified(release, asset, job).map(|(file, _)| file)
+}
+
+/// [`download`], with the lowercase hex SHA-256 the file was checked against.
+fn download_verified(release: &Release, asset: &Asset, job: &mut Job<'_>) -> Result<(PathBuf, String), String> {
     if !release::valid_file_name(&asset.name) {
         return Err("the release has an unexpected file name".into());
     }
@@ -386,7 +404,7 @@ pub(crate) fn download(release: &Release, asset: &Asset, job: &mut Job<'_>) -> R
         Transfer::Reconnecting { done, total } => phase(JobPhase::Reconnecting { done, total }),
     })?;
     (job.phase)(JobPhase::Verifying);
-    Ok(dest)
+    Ok((dest, sha.to_ascii_lowercase()))
 }
 
 /// The file's line in the release's `SHA256SUMS.txt`. `Ok(None)` only when the release really
@@ -744,8 +762,12 @@ pub fn failed_in_shared_call(error: &str) -> bool {
 }
 
 /// The system's installer runs one job at a time; the others wait their turn here.
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(target_os = "linux")]
 static INSTALLER: crate::queue::Queue = crate::queue::Queue::new();
+/// The Windows Installer runs one job at a time; the others wait their turn here, and MSIs that
+/// wait together are installed together (`crate::msi_batch`).
+#[cfg(windows)]
+static INSTALLER: crate::queue::Queue<crate::msi_batch::Job> = crate::queue::Queue::new();
 
 /// For [`INSTALLER`]: reports [`JobPhase::Waiting`] while a job waits, then `working` again.
 #[cfg(any(target_os = "linux", windows))]
@@ -789,8 +811,15 @@ pub(crate) mod linux {
 
     const SYSTEM: Root<'static> = Root { queue: &INSTALLER, run: &run_as_root };
 
+    /// Says, before its download, that a job will install a package of `kind` through the
+    /// system's package manager, so the jobs started together share one password prompt.
+    pub fn ticket(kind: PackageKind) -> Option<crate::queue::Ticket<'static, OsString>> {
+        install_command(kind).map(|command| INSTALLER.expect(command.iter().map(OsString::from).collect()))
+    }
+
     /// Runs `command target` as root. Jobs waiting for the same command go into one call
-    /// (`apt-get install a.deb b.deb`), so the password is asked for once.
+    /// (`apt-get install a.deb b.deb`), so the password is asked for once. `ticket` is the job's
+    /// own from [`ticket`], when it took one.
     fn as_root(
         root: &Root<'_>,
         command: &[&str],
@@ -798,9 +827,10 @@ pub(crate) mod linux {
         stop: &Stop,
         phase: &mut dyn FnMut(JobPhase),
         working: JobPhase,
+        ticket: Option<crate::queue::Ticket<'_, OsString>>,
     ) -> Result<(), String> {
         let command = command.iter().map(OsString::from).collect();
-        root.queue.batched(command, target.to_os_string(), &cancelled(stop), &mut turn(phase, working), &|command, targets| {
+        root.queue.batched_with(ticket, command, target.to_os_string(), &cancelled(stop), &mut turn(phase, working), &|command, targets| {
             let args: Vec<&OsStr> = command.iter().chain(targets).map(OsString::as_os_str).collect();
             shared_outcome((root.run)(&args), targets.len())
         })
@@ -902,20 +932,33 @@ pub(crate) mod linux {
     }
 
     /// Installs (or upgrades) a downloaded package with the system's own tools.
-    pub fn install_package(kind: PackageKind, file: &Path, stop: &Stop, phase: &mut dyn FnMut(JobPhase)) -> Result<(), String> {
+    pub fn install_package(
+        kind: PackageKind,
+        file: &Path,
+        stop: &Stop,
+        phase: &mut dyn FnMut(JobPhase),
+        ticket: Option<crate::queue::Ticket<'static, OsString>>,
+    ) -> Result<(), String> {
         if kind == PackageKind::Deb && system_tool("apt-get").is_none() {
             return Err("this system has no apt-get to install a Debian package with".into());
         }
         if kind == PackageKind::ArchPkg && system_tool("pacman").is_none() {
             return Err("this system has no pacman to install an Arch package with".into());
         }
-        install_package_via(&SYSTEM, kind, file, stop, phase)
+        install_package_via(&SYSTEM, kind, file, stop, phase, ticket)
     }
 
-    pub fn install_package_via(root: &Root<'_>, kind: PackageKind, file: &Path, stop: &Stop, phase: &mut dyn FnMut(JobPhase)) -> Result<(), String> {
+    pub fn install_package_via(
+        root: &Root<'_>,
+        kind: PackageKind,
+        file: &Path,
+        stop: &Stop,
+        phase: &mut dyn FnMut(JobPhase),
+        ticket: Option<crate::queue::Ticket<'_, OsString>>,
+    ) -> Result<(), String> {
         let f = file.as_os_str();
         if let Some(command) = install_command(kind) {
-            return as_root(root, command, f, stop, phase, JobPhase::Installing);
+            return as_root(root, command, f, stop, phase, JobPhase::Installing, ticket);
         }
         match kind {
             PackageKind::Flatpak => {
@@ -948,7 +991,7 @@ pub(crate) mod linux {
     }
 
     pub fn remove_package(app: &CraftApp, installed: &Installed, stop: &Stop, phase: &mut dyn FnMut(JobPhase)) -> Result<(), String> {
-        let mut remove = |command: &[&str], package: &str| as_root(&SYSTEM, command, OsStr::new(package), stop, phase, JobPhase::Removing);
+        let mut remove = |command: &[&str], package: &str| as_root(&SYSTEM, command, OsStr::new(package), stop, phase, JobPhase::Removing, None);
         match installed.source {
             InstallSource::Deb if system_tool("apt-get").is_some() => remove(&["apt-get", "-o", APT_WAITS, "remove", "-y"], app.id),
             InstallSource::Deb => remove(&["dpkg", "-r"], app.id),
@@ -1557,7 +1600,7 @@ fn msi_command(program: &Path, msi: &Path) -> Result<std::process::Command, Stri
 
 /// Where `msi_command` asks Windows Installer to write its log.
 #[cfg_attr(not(windows), allow(dead_code))]
-fn msi_log(msi: &Path) -> PathBuf {
+pub(crate) fn msi_log(msi: &Path) -> PathBuf {
     msi.with_extension("log")
 }
 
@@ -1573,48 +1616,99 @@ pub(crate) fn msi_path(msi: &Path) -> Result<PathBuf, String> {
     resolved.map_err(|e| format!("couldn't resolve the Windows Installer package {} ({e})", msi.display()))
 }
 
+/// What a Windows Installer exit code says about the install.
+#[cfg(any(windows, test))]
+pub(crate) fn msi_outcome(code: Option<i32>) -> Result<(), String> {
+    match code {
+        Some(0 | 3010 | 1641) => Ok(()),
+        Some(1602) => Err("cancelled".into()),
+        Some(1618) => Err("another installation is in progress. Wait for it to finish, then try again.".into()),
+        Some(1925 | 1303) => Err("Windows didn't allow the install (administrator permission is needed)".into()),
+        Some(c) => Err(format!("the Windows Installer stopped with error {c}")),
+        None => Err("the Windows Installer was interrupted".into()),
+    }
+}
+
 #[cfg(windows)]
 pub mod windows {
     use artcraft_launcher_core::protocol::CANCELLED;
 
-    use super::{CraftApp, INSTALLER, JobPhase, Path, PathBuf, Stop, cancelled, msi_command, msi_folder_argument, msi_log, process, turn};
+    use super::{
+        CraftApp, INSTALLER, JobPhase, Path, PathBuf, Stop, cancelled, msi_command, msi_folder_argument, msi_log, msi_outcome, process, turn,
+    };
+    use crate::msi_batch;
+    use crate::queue::Ticket;
 
-    fn msiexec() -> PathBuf {
-        std::env::var_os("SystemRoot").map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from).join(r"System32\msiexec.exe")
+    /// The Windows folder, as the machine's registry names it: what runs with administrator
+    /// rights is never found through the user's environment.
+    pub(crate) fn system_root() -> PathBuf {
+        use winreg::RegKey;
+        use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ};
+        RegKey::predef(HKEY_LOCAL_MACHINE)
+            .open_subkey_with_flags(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion", KEY_READ)
+            .and_then(|key| key.get_value::<String, _>("SystemRoot"))
+            .map(PathBuf::from)
+            .ok()
+            .filter(|path| path.is_absolute())
+            .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
     }
 
-    fn explain(code: Option<i32>) -> Result<(), String> {
-        match code {
-            Some(0 | 3010 | 1641) => Ok(()),
-            Some(1602) => Err("cancelled".into()),
-            Some(1618) => Err("another installation is in progress. Wait for it to finish, then try again.".into()),
-            Some(1925 | 1303) => Err("Windows didn't allow the install (administrator permission is needed)".into()),
-            Some(c) => Err(format!("the Windows Installer stopped with error {c}")),
-            None => Err("the Windows Installer was interrupted".into()),
+    pub(crate) fn msiexec() -> PathBuf {
+        system_root().join(r"System32\msiexec.exe")
+    }
+
+    /// A downloaded MSI, checked against its published SHA-256, to install.
+    pub struct Msi<'a> {
+        /// The app's name, for messages.
+        pub app: String,
+        pub file: &'a Path,
+        /// Lowercase hex.
+        pub sha256: &'a str,
+        pub destination: Option<&'a Path>,
+        /// The installed copy's program, to check again that it isn't running.
+        pub running: Option<PathBuf>,
+    }
+
+    /// Says, before its download, that a job will install an MSI (see [`run_msi`]).
+    pub fn ticket() -> Ticket<'static, msi_batch::Job> {
+        INSTALLER.expect(msi_batch::command())
+    }
+
+    /// Installs an MSI together with the others waiting for the Windows Installer: one UAC
+    /// prompt for all of them, then each installs without Windows Installer windows while the
+    /// launcher shows its progress (#67). `ticket` is the job's own from [`ticket`].
+    pub fn run_msi(
+        msi: Msi<'_>,
+        stop: &Stop,
+        phase: &mut dyn FnMut(JobPhase),
+        ticket: Option<Ticket<'static, msi_batch::Job>>,
+    ) -> Result<(), String> {
+        let job = msi_batch::Job::new(msi.app, msi.file, msi.sha256, msi.destination, msi.running)?;
+        msi_batch::join(&INSTALLER, ticket, job, stop, phase, &msi_batch::install)
+    }
+
+    /// Runs one MSI with a progress window and no restart; Windows asks for permission itself.
+    /// The way apps installed before [`run_msi`] asked once for all of them, and what it falls
+    /// back to when that one prompt can't be shown (PowerShell blocked by policy, say). The
+    /// caller holds the installer's turn.
+    pub(crate) fn run_msi_alone(msi: &Path, destination: Option<&Path>) -> Result<(), String> {
+        use std::os::windows::process::CommandExt;
+        let mut command = msi_command(&msiexec(), msi)?;
+        if let Some(dir) = destination {
+            command.raw_arg(msi_folder_argument(dir)?);
         }
-    }
-
-    /// Runs an MSI with a progress window and no restart. Windows asks for permission itself.
-    pub fn run_msi(msi: &Path, destination: Option<&Path>, stop: &Stop, phase: &mut dyn FnMut(JobPhase)) -> Result<(), String> {
-        in_turn(stop, phase, JobPhase::Installing, || {
-            use std::os::windows::process::CommandExt;
-            let mut command = msi_command(&msiexec(), msi)?;
-            if let Some(dir) = destination {
-                command.raw_arg(msi_folder_argument(dir)?);
-            }
-            let status = command.status().map_err(|e| format!("couldn't start the Windows Installer ({e})"))?;
-            explain(status.code()).map_err(|e| match status.code() {
-                Some(1602) | None => e,
-                _ => format!("{e}. Its log is at {}", msi_log(msi).display()),
-            })
+        let status = command.status().map_err(|e| format!("couldn't start the Windows Installer ({e})"))?;
+        msi_outcome(status.code()).map_err(|e| match status.code() {
+            Some(1602) | None => e,
+            _ => format!("{e}. Its log is at {}", msi_log(msi).display()),
         })
     }
 
     /// Runs the launcher's own new MSI for a self-update, with the same progress window and no
-    /// restart as [`run_msi`], and waits for it.
+    /// restart as [`run_msi_alone`], and waits for it.
     pub fn reinstall(msi: &Path) -> Result<(), String> {
         let status = msi_command(&msiexec(), msi)?.status().map_err(|e| format!("couldn't start the Windows Installer ({e})"))?;
-        explain(status.code())
+        msi_outcome(status.code())
     }
 
     /// Runs `work` once no other Windows Installer job of ours is running (a second one would
@@ -1634,7 +1728,7 @@ pub mod windows {
                     .args(["/x", &m.product_code, "/passive", "/norestart"])
                     .status()
                     .map_err(|e| format!("couldn't start the Windows Installer ({e})"))?;
-                explain(status.code())?;
+                msi_outcome(status.code())?;
             }
             Ok(())
         })
@@ -2234,7 +2328,7 @@ mod tests {
                             waiting.send(()).unwrap();
                         }
                     };
-                    linux::install_package_via(root, PackageKind::Deb, Path::new(file), &Stop::default(), &mut phase)
+                    linux::install_package_via(root, PackageKind::Deb, Path::new(file), &Stop::default(), &mut phase, None)
                 })
             });
             waits.recv().unwrap();
@@ -2277,7 +2371,8 @@ mod tests {
         }
         let queue = crate::queue::Queue::new();
         let root = linux::Root { queue: &queue, run: &|_| Ok(()) };
-        let result = linux::install_package_via(&root, PackageKind::Flatpak, Path::new("/nonexistent/file.flatpak"), &Stop::default(), &mut |_| ());
+        let result =
+            linux::install_package_via(&root, PackageKind::Flatpak, Path::new("/nonexistent/file.flatpak"), &Stop::default(), &mut |_| (), None);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.starts_with("Flatpak couldn't install the bundle: "), "unexpected error: {err}");
