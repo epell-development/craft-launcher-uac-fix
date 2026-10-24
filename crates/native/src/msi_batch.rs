@@ -19,21 +19,27 @@
 //! the prompt:
 //!
 //! - Paths and checksums come only from its command line, fixed when it starts.
-//! - Each MSI path must already be its own canonical form (no links on the way), and the file is
-//!   opened before it is checked, with sharing that refuses writes, renames and deletes. Its
-//!   SHA-256 is checked through that handle, which stays open while `msiexec` runs, so the file
-//!   can be neither swapped after the check nor while it installs.
-//! - The results file and each MSI's log are created new (never an existing file or link), in
-//!   folders whose paths have no links. A log is held open, refusing renames and deletes, until
-//!   `msiexec` has written it.
-//! - `msiexec` is found through the machine's registry, not the user's environment.
+//! - Each MSI path must already be its own canonical form (no links on the way). Every MSI is
+//!   opened first, with sharing that refuses writes, renames and deletes, which also keeps the
+//!   folders above it from being renamed or replaced while the batch runs.
+//! - Each MSI is copied through that handle into a new folder of the batch's own, under a random
+//!   name in the Windows temporary folder (the user's account can neither list it nor change
+//!   what is created in it), and the SHA-256 is computed from the bytes copied. `msiexec` installs
+//!   that copy, held open against changes, so what installs is exactly what was checked,
+//!   whatever the download's path leads to afterwards. The copy goes when the batch is done.
+//! - The results file and each MSI's log beside the download are created new (never an existing
+//!   file or link). `msiexec` writes its log in the staging folder; the helper copies it into the
+//!   new log through its own handle.
+//! - `msiexec` and PowerShell are found through the machine's registry, not the user's
+//!   environment.
 //! - It takes only absolute `.msi` paths and lowercase hex checksums, at most [`MOST`] of them,
 //!   and exits when the batch is done.
 //!
 //! Apps that are running are left out of the batch: the launcher checks again just before it
 //! asks for permission, so `/qn` never leaves files waiting for a reboot. When the prompt can't
 //! be shown at all (PowerShell blocked by policy, say), each MSI installs the way it did before,
-//! asking for permission itself.
+//! asking for permission itself; once the helper has started, nothing in the batch is installed
+//! any other way.
 
 use std::ffi::OsString;
 #[cfg(any(windows, test))]
@@ -67,10 +73,8 @@ const INSTALLING: u32 = 1;
 pub mod code {
     /// The file's SHA-256 isn't the one it was downloaded against.
     pub const CHECKSUM: i32 = -1;
-    /// A link on the way to the file or its log.
+    /// A link on the way to the file, or an install folder that can't be passed on.
     pub const UNSAFE_PATH: i32 = -2;
-    /// The log beside the MSI couldn't be created new.
-    pub const LOG: i32 = -3;
     /// The file couldn't be opened or `msiexec` couldn't be started.
     pub const NOT_STARTED: i32 = -4;
     /// `msiexec` ended without an exit code.
@@ -125,10 +129,10 @@ pub fn parse_args(args: &[OsString]) -> Result<Request, String> {
     if rest.is_empty() || !rest.len().is_multiple_of(3) || rest.len() / 3 > MOST {
         return Err(format!("expected 1 to {MOST} MSIs, each with its checksum and folder"));
     }
-    let items = rest
-        .chunks_exact(3)
-        .map(|chunk| {
-            let [msi, sha256, folder] = chunk else { return Err("an MSI is missing its checksum or folder".to_string()) };
+    let (items, []) = rest.as_chunks::<3>() else { return Err("an MSI is missing its checksum or folder".into()) };
+    let items = items
+        .iter()
+        .map(|[msi, sha256, folder]| {
             let msi = std::path::PathBuf::from(msi);
             let is_msi = msi.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("msi"));
             if !msi.is_absolute() || !is_msi {
@@ -150,6 +154,7 @@ pub fn parse_args(args: &[OsString]) -> Result<Request, String> {
     Ok(Request { results, items })
 }
 
+/// Whether `s` is a lowercase hex SHA-256.
 fn is_sha256(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
@@ -220,7 +225,6 @@ pub fn explain(code: Option<i32>, log: &Path) -> Result<(), String> {
         Some(code::UNSAFE_PATH) => {
             Err("the download folder's path goes through a link, so the installer wasn't run with administrator rights".into())
         }
-        Some(code::LOG) => Err(format!("couldn't create the Windows Installer's log at {}", log.display())),
         Some(code::NOT_STARTED) => Err("couldn't start the Windows Installer".into()),
         Some(code::INTERRUPTED) | None => Err("the Windows Installer was interrupted".into()),
         Some(c @ (1602 | 0 | 3010 | 1641)) => crate::install::msi_outcome(Some(c)),
@@ -241,6 +245,7 @@ pub type Install<'a> = dyn Fn(&[Job], &dyn Fn(u32)) -> Outcomes + Sync + 'a;
 pub struct Job {
     /// The app's name, for messages.
     pub name: String,
+    /// What the helper is told to install.
     pub item: Item,
     /// The installed copy's program, to check again that it isn't running.
     pub running: Option<PathBuf>,
@@ -347,10 +352,11 @@ pub fn install(jobs: &[Job], report: &dyn Fn(u32)) -> Outcomes {
             let codes = parse_results(&text, pending.len());
             for (code, at) in codes.into_iter().zip(&pending) {
                 let (Some(slot), Some(job)) = (outcomes.get_mut(*at), jobs.get(*at)) else { continue };
-                let outcome = match code {
-                    Some(code) => explain(Some(code), &crate::install::msi_log(&job.item.msi)),
-                    None if exit != 0 => Err(format!("the installer helper stopped with error {exit}")),
-                    None => explain(None, &crate::install::msi_log(&job.item.msi)),
+                let outcome = match (code, exit) {
+                    (Some(code), _) => explain(Some(code), &crate::install::msi_log(&job.item.msi)),
+                    (None, Some(0)) => explain(None, &crate::install::msi_log(&job.item.msi)),
+                    (None, Some(exit)) => Err(format!("the installer helper stopped with error {exit}")),
+                    (None, None) => Err("lost track of the installer helper. Check whether the app was installed, then try again".into()),
                 };
                 *slot = Some(outcome);
             }
@@ -363,6 +369,7 @@ pub fn install(jobs: &[Job], report: &dyn Fn(u32)) -> Outcomes {
 /// Starting the helper with administrator rights, and the helper itself.
 #[cfg(windows)]
 mod elevated {
+    use std::fs::{File, OpenOptions};
     use std::io::{Read, Write};
     use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::process::CommandExt;
@@ -371,20 +378,23 @@ mod elevated {
 
     use super::{Item, Request, code, command_line, helper_args, result_line};
 
+    /// `FILE_SHARE_READ`: others may read the file while it's open, but not change it.
     const FILE_SHARE_READ: u32 = 0x1;
-    const FILE_SHARE_WRITE: u32 = 0x2;
-    const GENERIC_READ: u32 = 0x8000_0000;
     /// `ERROR_CANCELLED`: the user declined the UAC prompt.
     const DECLINED: i32 = 1223;
     /// What the starter script exits with when it couldn't show the prompt at all. The helper
     /// never exits with it.
     const NO_PROMPT: i32 = 1;
-    /// The helper's exit codes.
+    /// The helper ran the batch; the results file has each MSI's code.
     pub const EXIT_DONE: u8 = 0;
+    /// The helper's arguments were refused; nothing ran.
     pub const EXIT_ARGUMENTS: u8 = 2;
+    /// The results file couldn't be created or written.
     pub const EXIT_RESULTS: u8 = 3;
 
+    /// The environment variable [`SCRIPT`] reads the program to start from.
     const EXE_VAR: &str = "ARTCRAFT_LAUNCHER_ELEVATE_EXE";
+    /// The environment variable [`SCRIPT`] reads the program's command line from.
     const ARGS_VAR: &str = "ARTCRAFT_LAUNCHER_ELEVATE_ARGS";
 
     /// Starts `$env:ARTCRAFT_LAUNCHER_ELEVATE_EXE` with `$env:ARTCRAFT_LAUNCHER_ELEVATE_ARGS` as
@@ -405,14 +415,17 @@ mod elevated {
 
     /// How the elevated helper's run went.
     pub enum Ran {
-        /// The user declined the prompt.
+        /// The user declined the prompt; nothing ran.
         Declined,
-        /// The prompt couldn't be shown; nothing ran.
+        /// The prompt couldn't be shown; nothing ran, so each MSI may still ask for itself.
         Unavailable(String),
-        /// The helper ran and exited with this code; the results file says the rest.
-        Exited(i32),
+        /// The helper ran (or may have run) and exited with this code, `None` when the launcher
+        /// lost track of it. The results file says the rest; no MSI of the batch is installed
+        /// again any other way.
+        Exited(Option<i32>),
     }
 
+    /// Windows PowerShell, from the folder the machine's registry names.
     fn powershell() -> PathBuf {
         crate::install::windows::system_root().join(r"System32\WindowsPowerShell\v1.0\powershell.exe")
     }
@@ -438,15 +451,25 @@ mod elevated {
             Err(e) => return Ran::Unavailable(format!("couldn't start PowerShell ({e})")),
         };
         let mut told = false;
+        // Once the helper has created the results file it has started installing: whatever
+        // happens next, nothing falls back to installing the batch a second way.
+        let mut helper_started = || {
+            if !told && request.results.exists() {
+                told = true;
+                started();
+            }
+            told
+        };
         let status = loop {
             match child.try_wait() {
                 Ok(Some(status)) => break status,
                 Ok(None) => {
-                    if !told && request.results.exists() {
-                        told = true;
-                        started();
-                    }
+                    helper_started();
                     std::thread::sleep(Duration::from_millis(200));
+                }
+                Err(e) if helper_started() => {
+                    log::warn!("lost track of the elevated installer helper ({e})");
+                    return Ran::Exited(None);
                 }
                 Err(e) => {
                     let _ = child.kill();
@@ -456,9 +479,10 @@ mod elevated {
             }
         };
         match status.code() {
+            _ if helper_started() => Ran::Exited(status.code()),
             Some(DECLINED) => Ran::Declined,
             Some(NO_PROMPT) | None => Ran::Unavailable(format!("PowerShell couldn't show the prompt ({status})")),
-            Some(code) => Ran::Exited(code),
+            Some(code) => Ran::Exited(Some(code)),
         }
     }
 
@@ -470,54 +494,86 @@ mod elevated {
     /// The helper, running as administrator: installs every MSI of `request` and writes each
     /// one's code to the results file. Returns its exit code.
     pub fn helper(request: &Request) -> u8 {
+        // Every MSI is opened first, refusing writes, renames and deletes. While a file is open
+        // the folders above it can't be renamed or replaced either, so the results file and the
+        // logs created beside the MSIs below land where the paths say.
+        let sources: Vec<Result<File, i32>> = request.items.iter().map(open_source).collect();
         if !request.results.parent().is_some_and(plain) {
             log::error!("the results file's folder isn't a plain path");
             return EXIT_RESULTS;
         }
-        let mut results = match std::fs::OpenOptions::new().write(true).create_new(true).open(&request.results) {
+        let mut results = match OpenOptions::new().write(true).create_new(true).open(&request.results) {
             Ok(file) => file,
             Err(e) => {
                 log::error!("couldn't create the results file ({e})");
                 return EXIT_RESULTS;
             }
         };
+        let staging = staging_folder();
         let msiexec = crate::install::windows::msiexec();
-        for (index, item) in request.items.iter().enumerate() {
-            let code = install_one(item, &msiexec);
+        for (index, (item, source)) in request.items.iter().zip(sources).enumerate() {
+            let code = match (source, &staging) {
+                (Ok(source), Some(staging)) => install_one(index, item, source, staging, &msiexec),
+                (Ok(_), None) => code::NOT_STARTED,
+                (Err(code), _) => code,
+            };
             if writeln!(results, "{}", result_line(index, code)).and_then(|()| results.flush()).is_err() {
                 return EXIT_RESULTS;
             }
         }
+        if let Some(staging) = staging {
+            let _ = std::fs::remove_dir_all(staging);
+        }
         EXIT_DONE
     }
 
-    /// Checks and installs one MSI without Windows Installer windows; its code for the results.
-    fn install_one(item: &Item, msiexec: &Path) -> i32 {
+    /// Opens a downloaded MSI so no one can write, rename or delete it while it's open.
+    fn open_source(item: &Item) -> Result<File, i32> {
         if !plain(&item.msi) {
-            return code::UNSAFE_PATH;
+            return Err(code::UNSAFE_PATH);
         }
-        // No one may write, rename or delete it from here until msiexec is done with it.
-        let Ok(mut msi) = std::fs::OpenOptions::new().read(true).share_mode(FILE_SHARE_READ).open(&item.msi) else {
+        OpenOptions::new().read(true).share_mode(FILE_SHARE_READ).open(&item.msi).map_err(|_| code::NOT_STARTED)
+    }
+
+    /// A new folder of this batch's own in the Windows temporary folder, under a random name: the
+    /// user's account can't list that folder, nor change the files created in it.
+    fn staging_folder() -> Option<PathBuf> {
+        let mut name = [0u8; 16];
+        getrandom::fill(&mut name).ok()?;
+        let temp = dunce::canonicalize(crate::install::windows::system_root().join("Temp")).ok()?;
+        let folder = temp.join(format!("artcraft-launcher-msi-{}", crate::http::hex(&name)));
+        std::fs::create_dir(&folder).ok()?;
+        Some(folder)
+    }
+
+    /// Copies the checked MSI into the staging folder and installs that copy without Windows
+    /// Installer windows; its code for the results. The copy's SHA-256 is computed from the bytes
+    /// written, so what msiexec installs is exactly what was checked, wherever the download's
+    /// path leads afterwards.
+    fn install_one(index: usize, item: &Item, mut source: File, staging: &Path, msiexec: &Path) -> i32 {
+        let Some(name) = item.msi.file_name() else { return code::UNSAFE_PATH };
+        let folder = staging.join(index.to_string());
+        if std::fs::create_dir(&folder).is_err() {
             return code::NOT_STARTED;
-        };
-        if !sha256_of(&mut msi).is_some_and(|sha| sha == item.sha256) {
-            return code::CHECKSUM;
         }
-        let log = crate::install::msi_log(&item.msi);
-        // A file or link left there goes (removing a link never touches what it points to); the
-        // log is then created new and held so it can't be swapped before msiexec writes it.
-        let _ = std::fs::remove_file(&log);
-        let Ok(held_log) = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .access_mode(GENERIC_READ)
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-            .open(&log)
-        else {
-            return code::LOG;
-        };
+        let staged = folder.join(name);
+        match stage(&mut source, &staged) {
+            Some(sha) if sha == item.sha256 => {}
+            Some(_) => return code::CHECKSUM,
+            None => return code::NOT_STARTED,
+        }
+        drop(source);
+        // Held while msiexec reads it: no one may change it in the meantime.
+        let Ok(held) = OpenOptions::new().read(true).share_mode(FILE_SHARE_READ).open(&staged) else { return code::NOT_STARTED };
+        let staged_log = folder.join("install.log");
+        // The log the user reads, beside the download: created new now (a file or link left there
+        // goes first; removing a link never touches what it points to), and filled from the
+        // staged log through this handle once msiexec is done.
+        let user_log = crate::install::msi_log(&item.msi);
+        let _ = std::fs::remove_file(&user_log);
+        let mut kept_log = OpenOptions::new().write(true).create_new(true).share_mode(FILE_SHARE_READ).open(&user_log).ok();
         let mut command = crate::process::command(msiexec);
-        command.arg("/i").arg(&item.msi).args(["/qn", "/norestart", "/l*v"]).arg(&log);
+        command.arg("/i").arg(&staged).args(["/qn", "/norestart", "/l*v"]).arg(&staged_log);
         if let Some(folder) = &item.folder {
             match crate::install::msi_folder_argument(folder) {
                 Ok(argument) => {
@@ -530,16 +586,30 @@ mod elevated {
             Ok(status) => status.code().unwrap_or(code::INTERRUPTED),
             Err(_) => code::NOT_STARTED,
         };
-        drop(held_log);
-        drop(msi);
+        drop(held);
+        if let (Some(out), Ok(mut log)) = (kept_log.as_mut(), File::open(&staged_log)) {
+            let _ = std::io::copy(&mut log, out);
+        }
         code
     }
 
-    /// The lowercase hex SHA-256 of what `file` reads.
-    fn sha256_of(file: &mut impl Read) -> Option<String> {
+    /// Copies `source` into a new file at `staged`, which no one else may open meanwhile, and
+    /// returns the lowercase hex SHA-256 of the bytes written.
+    fn stage(source: &mut File, staged: &Path) -> Option<String> {
         use sha2::{Digest, Sha256};
+        let mut out = OpenOptions::new().write(true).create_new(true).share_mode(0).open(staged).ok()?;
         let mut hasher = Sha256::new();
-        std::io::copy(file, &mut hasher).ok()?;
+        let mut buffer = vec![0u8; 1 << 16];
+        loop {
+            let read = source.read(&mut buffer).ok()?;
+            if read == 0 {
+                break;
+            }
+            let chunk = buffer.get(..read)?;
+            hasher.update(chunk);
+            out.write_all(chunk).ok()?;
+        }
+        out.flush().ok()?;
         Some(crate::http::hex(&hasher.finalize()))
     }
 

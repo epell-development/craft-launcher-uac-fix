@@ -30,12 +30,14 @@ pub enum Step {
 /// The outcome a job gets when its call ended without saying (the installer died).
 const INTERRUPTED: &str = "the system installer was interrupted";
 
+/// A job waiting to join a call.
 struct Waiting<T> {
     id: u64,
     command: Vec<OsString>,
     target: T,
 }
 
+/// What every job of the queue sees, under its lock.
 struct State<T> {
     busy: bool,
     next_id: u64,
@@ -50,6 +52,7 @@ struct State<T> {
 }
 
 impl<T> State<T> {
+    /// Takes one [`Ticket`] for `command` off the list of expected jobs.
     fn forget(&mut self, command: &[OsString]) {
         if let Some(at) = self.expected.iter().position(|c| c == command) {
             self.expected.swap_remove(at);
@@ -57,6 +60,8 @@ impl<T> State<T> {
     }
 }
 
+/// Jobs waiting for the system's installer, with the target each brings to its call (a package
+/// file for Linux package managers, an MSI job on Windows).
 pub struct Queue<T = OsString> {
     state: Mutex<State<T>>,
     changed: Condvar,
@@ -113,11 +118,13 @@ impl<T> Default for Queue<T> {
 }
 
 impl<T> Queue<T> {
+    /// An empty queue, with the installer free.
     pub const fn new() -> Self {
         let state = State { busy: false, next_id: 0, waiting: Vec::new(), running: Vec::new(), stage: 0, finished: Vec::new(), expected: Vec::new() };
         Self { state: Mutex::new(state), changed: Condvar::new() }
     }
 
+    /// The queue's state, even after a job panicked while holding it.
     fn lock(&self) -> MutexGuard<'_, State<T>> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -264,26 +271,13 @@ impl Queue<OsString> {
         turn: &mut dyn FnMut(bool),
         exec: &dyn Fn(&[OsString], &[OsString]) -> Outcome,
     ) -> Outcome {
-        self.batched_with(None, command, target, cancelled, turn, exec)
-    }
-
-    /// [`Queue::batched`] for a job that took a [`Ticket`] before its download.
-    pub fn batched_with(
-        &self,
-        ticket: Option<Ticket<'_, OsString>>,
-        command: Vec<OsString>,
-        target: OsString,
-        cancelled: &dyn Fn() -> bool,
-        turn: &mut dyn FnMut(bool),
-        exec: &dyn Fn(&[OsString], &[OsString]) -> Outcome,
-    ) -> Outcome {
         // Such a call has no stages past its start.
         let mut step = |s: Step| {
             if matches!(s, Step::Waiting | Step::Running(0)) {
                 turn(s == Step::Waiting);
             }
         };
-        self.batch(ticket, command, target, cancelled, &mut step, &|command, targets, _| {
+        self.batch(None, command, target, cancelled, &mut step, &|command, targets, _| {
             let outcome = exec(command, targets);
             vec![outcome; targets.len()]
         })
@@ -300,6 +294,24 @@ mod tests {
 
     fn os(s: &str) -> OsString {
         OsString::from(s)
+    }
+
+    /// [`Queue::batched`] for a job that took a [`Ticket`] before its download.
+    fn batched_with(
+        queue: &Queue,
+        ticket: Option<Ticket<'_, OsString>>,
+        command: Vec<OsString>,
+        target: OsString,
+        cancelled: &dyn Fn() -> bool,
+        turn: &mut dyn FnMut(bool),
+        exec: &dyn Fn(&[OsString], &[OsString]) -> Outcome,
+    ) -> Outcome {
+        let mut step = |s: Step| {
+            if matches!(s, Step::Waiting | Step::Running(0)) {
+                turn(s == Step::Waiting);
+            }
+        };
+        queue.batch(ticket, command, target, cancelled, &mut step, &|command, targets, _| vec![exec(command, targets); targets.len()])
     }
 
     fn line(parts: &[&str]) -> Vec<OsString> {
@@ -650,10 +662,10 @@ mod tests {
             let fast = queue.expect(install());
             // The first download is ready: nothing is running, but the other is still coming.
             let first =
-                scope.spawn(move || queue.batched_with(Some(fast), install(), os("a.deb"), &|| false, &mut |w| turned.send(w).unwrap(), exec));
+                scope.spawn(move || batched_with(queue, Some(fast), install(), os("a.deb"), &|| false, &mut |w| turned.send(w).unwrap(), exec));
             assert!(turns.recv().unwrap(), "it waits for the other download");
             assert!(calls.0.lock().unwrap().is_empty());
-            let second = scope.spawn(move || queue.batched_with(Some(slow), install(), os("b.deb"), &|| false, &mut |_| {}, exec));
+            let second = scope.spawn(move || batched_with(queue, Some(slow), install(), os("b.deb"), &|| false, &mut |_| {}, exec));
             assert_eq!(first.join().unwrap(), Ok(()));
             assert_eq!(second.join().unwrap(), Ok(()));
         });
@@ -669,7 +681,7 @@ mod tests {
             let failing = queue.expect(install());
             let (turned, turns) = mpsc::channel();
             let ready = scope.spawn(move || {
-                queue.batched_with(None, install(), os("a.deb"), &|| false, &mut |w| turned.send(w).unwrap(), &|command, targets| {
+                batched_with(queue, None, install(), os("a.deb"), &|| false, &mut |w| turned.send(w).unwrap(), &|command, targets| {
                     calls.record(command, targets);
                     Ok(())
                 })

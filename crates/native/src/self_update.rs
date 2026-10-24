@@ -256,14 +256,14 @@ pub fn update(
             }
             #[cfg(target_os = "linux")]
             Install::Package(kind, exe) => {
-                let result = install::linux::install_package(*kind, &file, stop, phase, None);
+                let result = install::linux::install_package(*kind, &file, stop, phase);
                 let _ = std::fs::remove_file(&file);
                 result?;
                 relaunch_after_exit(pid, &[exe.as_os_str()])
             }
             #[cfg(target_os = "linux")]
             Install::Flatpak => {
-                let result = install::linux::install_package(PackageKind::Flatpak, &file, stop, phase, None);
+                let result = install::linux::install_package(PackageKind::Flatpak, &file, stop, phase);
                 let _ = std::fs::remove_file(&file);
                 result?;
                 relaunch_flatpak_after_exit()

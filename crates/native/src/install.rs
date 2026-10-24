@@ -90,12 +90,10 @@ pub fn install_at(
         return Err(format!("Cannot update {} to {}: installed version {} is newer", app.name, release.version_label(), inst_v));
     }
     log::info!("{}: starting {} to {} ({})", app.name, if existing.is_some() { "update" } else { "install" }, release.version_label(), kind.label());
-    // Said before the download starts, so jobs started together (Update all) install together,
+    // Said before the download starts, so MSIs started together (Update all) install together,
     // behind one permission prompt, however long each download takes.
     #[cfg(windows)]
     let ticket = (kind == PackageKind::Msi).then(windows::ticket);
-    #[cfg(target_os = "linux")]
-    let ticket = linux::ticket(kind);
     #[allow(unused_variables)]
     let (file, sha256) = download_verified(release, asset, job)?;
     log::info!("{}: download ready ({}), running installer...", app.name, file.display());
@@ -132,7 +130,7 @@ pub fn install_at(
         }
         #[cfg(target_os = "linux")]
         PackageKind::Deb | PackageKind::Rpm | PackageKind::ArchPkg | PackageKind::Flatpak => {
-            linux::install_package(kind, &file, job.stop, &mut *job.phase, ticket).map(|_| None)
+            linux::install_package(kind, &file, job.stop, &mut *job.phase).map(|_| None)
         }
         #[cfg(target_os = "linux")]
         PackageKind::AppImage => {
@@ -811,15 +809,8 @@ pub(crate) mod linux {
 
     const SYSTEM: Root<'static> = Root { queue: &INSTALLER, run: &run_as_root };
 
-    /// Says, before its download, that a job will install a package of `kind` through the
-    /// system's package manager, so the jobs started together share one password prompt.
-    pub fn ticket(kind: PackageKind) -> Option<crate::queue::Ticket<'static, OsString>> {
-        install_command(kind).map(|command| INSTALLER.expect(command.iter().map(OsString::from).collect()))
-    }
-
     /// Runs `command target` as root. Jobs waiting for the same command go into one call
-    /// (`apt-get install a.deb b.deb`), so the password is asked for once. `ticket` is the job's
-    /// own from [`ticket`], when it took one.
+    /// (`apt-get install a.deb b.deb`), so the password is asked for once.
     fn as_root(
         root: &Root<'_>,
         command: &[&str],
@@ -827,10 +818,9 @@ pub(crate) mod linux {
         stop: &Stop,
         phase: &mut dyn FnMut(JobPhase),
         working: JobPhase,
-        ticket: Option<crate::queue::Ticket<'_, OsString>>,
     ) -> Result<(), String> {
         let command = command.iter().map(OsString::from).collect();
-        root.queue.batched_with(ticket, command, target.to_os_string(), &cancelled(stop), &mut turn(phase, working), &|command, targets| {
+        root.queue.batched(command, target.to_os_string(), &cancelled(stop), &mut turn(phase, working), &|command, targets| {
             let args: Vec<&OsStr> = command.iter().chain(targets).map(OsString::as_os_str).collect();
             shared_outcome((root.run)(&args), targets.len())
         })
@@ -932,33 +922,20 @@ pub(crate) mod linux {
     }
 
     /// Installs (or upgrades) a downloaded package with the system's own tools.
-    pub fn install_package(
-        kind: PackageKind,
-        file: &Path,
-        stop: &Stop,
-        phase: &mut dyn FnMut(JobPhase),
-        ticket: Option<crate::queue::Ticket<'static, OsString>>,
-    ) -> Result<(), String> {
+    pub fn install_package(kind: PackageKind, file: &Path, stop: &Stop, phase: &mut dyn FnMut(JobPhase)) -> Result<(), String> {
         if kind == PackageKind::Deb && system_tool("apt-get").is_none() {
             return Err("this system has no apt-get to install a Debian package with".into());
         }
         if kind == PackageKind::ArchPkg && system_tool("pacman").is_none() {
             return Err("this system has no pacman to install an Arch package with".into());
         }
-        install_package_via(&SYSTEM, kind, file, stop, phase, ticket)
+        install_package_via(&SYSTEM, kind, file, stop, phase)
     }
 
-    pub fn install_package_via(
-        root: &Root<'_>,
-        kind: PackageKind,
-        file: &Path,
-        stop: &Stop,
-        phase: &mut dyn FnMut(JobPhase),
-        ticket: Option<crate::queue::Ticket<'_, OsString>>,
-    ) -> Result<(), String> {
+    pub fn install_package_via(root: &Root<'_>, kind: PackageKind, file: &Path, stop: &Stop, phase: &mut dyn FnMut(JobPhase)) -> Result<(), String> {
         let f = file.as_os_str();
         if let Some(command) = install_command(kind) {
-            return as_root(root, command, f, stop, phase, JobPhase::Installing, ticket);
+            return as_root(root, command, f, stop, phase, JobPhase::Installing);
         }
         match kind {
             PackageKind::Flatpak => {
@@ -991,7 +968,7 @@ pub(crate) mod linux {
     }
 
     pub fn remove_package(app: &CraftApp, installed: &Installed, stop: &Stop, phase: &mut dyn FnMut(JobPhase)) -> Result<(), String> {
-        let mut remove = |command: &[&str], package: &str| as_root(&SYSTEM, command, OsStr::new(package), stop, phase, JobPhase::Removing, None);
+        let mut remove = |command: &[&str], package: &str| as_root(&SYSTEM, command, OsStr::new(package), stop, phase, JobPhase::Removing);
         match installed.source {
             InstallSource::Deb if system_tool("apt-get").is_some() => remove(&["apt-get", "-o", APT_WAITS, "remove", "-y"], app.id),
             InstallSource::Deb => remove(&["dpkg", "-r"], app.id),
@@ -1653,6 +1630,7 @@ pub mod windows {
             .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
     }
 
+    /// The Windows Installer, `msiexec.exe`, from the folder the machine's registry names.
     pub(crate) fn msiexec() -> PathBuf {
         system_root().join(r"System32\msiexec.exe")
     }
@@ -1717,6 +1695,8 @@ pub mod windows {
         INSTALLER.alone(&cancelled(stop), &mut turn(phase, working), work).unwrap_or_else(|| Err(CANCELLED.into()))
     }
 
+    /// Removes every Windows Installer registration of `app`, with a progress window and no
+    /// restart, once no other Windows Installer job of ours is running.
     pub fn uninstall_msi(app: &CraftApp, stop: &Stop, phase: &mut dyn FnMut(JobPhase)) -> Result<(), String> {
         let installs = crate::detect::windows::msi_installs(app);
         if installs.is_empty() {
@@ -2328,7 +2308,7 @@ mod tests {
                             waiting.send(()).unwrap();
                         }
                     };
-                    linux::install_package_via(root, PackageKind::Deb, Path::new(file), &Stop::default(), &mut phase, None)
+                    linux::install_package_via(root, PackageKind::Deb, Path::new(file), &Stop::default(), &mut phase)
                 })
             });
             waits.recv().unwrap();
@@ -2371,8 +2351,7 @@ mod tests {
         }
         let queue = crate::queue::Queue::new();
         let root = linux::Root { queue: &queue, run: &|_| Ok(()) };
-        let result =
-            linux::install_package_via(&root, PackageKind::Flatpak, Path::new("/nonexistent/file.flatpak"), &Stop::default(), &mut |_| (), None);
+        let result = linux::install_package_via(&root, PackageKind::Flatpak, Path::new("/nonexistent/file.flatpak"), &Stop::default(), &mut |_| ());
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.starts_with("Flatpak couldn't install the bundle: "), "unexpected error: {err}");
