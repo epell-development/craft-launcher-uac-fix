@@ -238,6 +238,9 @@ impl LauncherUi {
         self.applied_motion = None;
         self.motion_recheck = 0.0;
         self.toasts.clear();
+        // So the next frame announces a permission prompt that is still up.
+        self.asking_for.clear();
+        self.asking_toast = None;
     }
 
     /// Input on its way to egui (the shell's `raw_input_hook`): with fewer animations asked for,
@@ -284,7 +287,9 @@ impl LauncherUi {
                 None => e.app.name.to_string(),
             })
             .collect();
-        if asking == self.asking_for {
+        // A toast that went (cleared with a new window, say) is shown again while the prompt is up.
+        let shown = self.asking_toast.as_ref().is_some_and(|text| self.toasts.iter().any(|t| &t.text == text));
+        if asking == self.asking_for && (asking.is_empty() || shown) {
             return;
         }
         if let Some(old) = self.asking_toast.take() {
@@ -303,8 +308,11 @@ impl LauncherUi {
     pub(crate) fn toast(&mut self, ctx: &egui::Context, text: impl Into<String>, error: bool) {
         let now = ctx.input(|i| i.time);
         self.toasts.push(Toast { text: text.into(), error, until: now + if error { 8.0 } else { 4.5 } });
-        if self.toasts.len() > 4 {
-            self.toasts.remove(0);
+        // The oldest goes, but never the list of apps a permission prompt that's up is for.
+        if self.toasts.len() > 4
+            && let Some(oldest) = self.toasts.iter().position(|t| self.asking_toast.as_ref() != Some(&t.text))
+        {
+            self.toasts.remove(oldest);
         }
     }
 
