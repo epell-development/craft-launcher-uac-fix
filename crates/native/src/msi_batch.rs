@@ -19,14 +19,15 @@
 //! ArtCraft Launcher's name, so the helper does only what the launcher itself may do (CWE-441):
 //!
 //! - It runs only when its own exe carries a valid Authenticode signature from
-//!   [`KNOWN_PUBLISHER`], and installs only MSIs signed by that same publisher, checked on the
+//!   [`crate::signing::PUBLISHER`], and installs only MSIs signed by that same publisher, checked on the
 //!   staged copy `msiexec` reads.
 //! - Each MSI must be a Craft App's own Windows release by file name (`policy::craft_msi`), may
 //!   not replace a newer version installed for the whole machine, and installs where that
 //!   install already is, or into a new folder named after the app outside the Windows folder.
 //!   The registry it reads for that is the machine's (HKLM), never the user's.
-//! - The launcher sends only MSIs that pass the same signature check; any other MSI installs the
-//!   way it did before the batch, with Windows Installer's own prompt.
+//! - The launcher sends only MSIs that pass the same checks ([`batchable`], asked before the job
+//!   joins the queue); any other MSI, such as a per-user install in a folder of its own, installs
+//!   the way it did before the batch, with Windows Installer's own prompt.
 //! - Its imported DLLs load from System32 only (`/DEPENDENTLOADFLAG`, in `build.rs`), not from
 //!   the user-writable folder the exe runs from.
 //!
@@ -39,9 +40,10 @@
 //!   folders above it from being renamed or replaced while the batch runs.
 //! - Each MSI is copied through that handle into a new folder of the batch's own, under a random
 //!   name in the Windows temporary folder, whose access list is first replaced so only
-//!   Administrators and SYSTEM can open it, and the SHA-256 is computed from the bytes copied. `msiexec` installs
-//!   that copy, held open against changes, so what installs is exactly what was checked,
-//!   whatever the download's path leads to afterwards. The copy goes when the batch is done.
+//!   Administrators and SYSTEM can open it, and the SHA-256 is computed from the bytes copied.
+//!   `msiexec` installs that copy, held open against changes, so what installs is exactly what
+//!   was checked, whatever the download's path leads to afterwards. The folder goes however the
+//!   helper ends.
 //! - The results file and each MSI's log beside the download are created new (never an existing
 //!   file or link). `msiexec` writes its log in the staging folder; the helper copies it into the
 //!   new log through its own handle.
@@ -50,8 +52,11 @@
 //! - It takes only absolute `.msi` paths and lowercase hex checksums, at most [`MOST`] of them,
 //!   and exits when the batch is done.
 //!
-//! Apps that are running are left out of the batch: the launcher checks again just before it
-//! asks for permission, so `/qn` never leaves files waiting for a reboot. When the prompt can't
+//! Apps that are running are left out of the batch: the launcher checks just before it asks for
+//! permission, and the helper again just before each `msiexec`, however long the prompt was up.
+//! If Windows still reports a restart is needed (3010), the app's card says so rather than that
+//! the update worked. While the prompt is up the launcher lists every app and version it covers.
+//! Signatures are checked from local data only, never online. When the prompt can't
 //! be shown at all (PowerShell blocked by policy, say), each MSI installs the way it did before,
 //! asking for permission itself; once the helper has started, nothing in the batch is installed
 //! any other way.
@@ -98,6 +103,11 @@ pub mod code {
     pub const UNSIGNED: i32 = -6;
     /// The file isn't a Craft App's Windows MSI, or would replace a newer version of the app.
     pub const NOT_ALLOWED: i32 = -7;
+    /// The install folder isn't one the app may get with administrator rights (see
+    /// [`super::policy::folder_allowed`]).
+    pub const FOLDER: i32 = -8;
+    /// The app was running when its turn came: it was left out.
+    pub const RUNNING: i32 = -9;
 }
 
 /// What the elevated helper allows, apart from the files' signatures: a Craft App's own Windows
@@ -304,8 +314,12 @@ pub fn explain(code: Option<i32>, log: &Path) -> Result<(), String> {
         Some(code::NOT_STARTED) => Err("couldn't start the Windows Installer".into()),
         Some(code::UNSIGNED) => Err("the installer isn't signed by ArtCraft Launcher's publisher, so it wasn't installed".into()),
         Some(code::NOT_ALLOWED) => Err("the installer isn't a Craft App release this launcher may install here, so it wasn't installed".into()),
+        Some(code::FOLDER) => Err("the chosen install folder can't be used for an install with administrator rights, so it wasn't installed".into()),
+        Some(code::RUNNING) => Err("the app was opened while waiting for permission, so it wasn't updated. Quit it, then try again".into()),
         Some(code::INTERRUPTED) | None => Err("the Windows Installer was interrupted".into()),
-        Some(c @ (1602 | 0 | 3010 | 1641)) => crate::install::msi_outcome(Some(c)),
+        // Files were in use: the new version is only in place once Windows restarts.
+        Some(3010 | 1641) => Err("installed, but Windows needs to restart to finish. Restart, then check for updates again".into()),
+        Some(c @ (1602 | 0)) => crate::install::msi_outcome(Some(c)),
         Some(c) => crate::install::msi_outcome(Some(c)).map_err(|e| format!("{e}. Its log is at {}", log.display())),
     }
 }
@@ -327,6 +341,9 @@ pub struct Job {
     pub item: Item,
     /// The installed copy's program, to check again that it isn't running.
     pub running: Option<PathBuf>,
+    /// Whether it may go to the elevated helper (see [`batchable`]); otherwise it installs the way
+    /// it did before batches, with Windows Installer's own prompt.
+    pub batchable: bool,
 }
 
 #[cfg(any(windows, test))]
@@ -342,7 +359,7 @@ impl Job {
         if !is_sha256(&sha256) {
             return Err(format!("{name}'s checksum isn't a SHA-256"));
         }
-        Ok(Self { name, item: Item { msi, sha256, folder: folder.map(Path::to_path_buf) }, running })
+        Ok(Self { name, item: Item { msi, sha256, folder: folder.map(Path::to_path_buf) }, running, batchable: false })
     }
 }
 
@@ -384,14 +401,45 @@ pub fn join(
     })
 }
 
+/// Whether `item` is a Craft App release the helper may install, where it's asked to (see
+/// [`policy`]): the machine-wide install's program (to check it isn't running) when it is, the
+/// code to report otherwise. Reads only what an administrator controls: the machine-wide
+/// Windows Installer registrations and the Windows folder from the registry. The launcher asks
+/// before the prompt, the helper again after it.
+#[cfg(windows)]
+pub(crate) fn vet(item: &Item) -> Result<Option<PathBuf>, i32> {
+    let name = item.msi.file_name().and_then(|n| n.to_str()).ok_or(code::NOT_ALLOWED)?;
+    let (app, version) = policy::craft_msi(name).ok_or(code::NOT_ALLOWED)?;
+    let installed = crate::detect::windows::machine_msi_installs(app).into_iter().next();
+    if !policy::not_a_downgrade(&version, installed.as_ref().and_then(|m| m.version.as_ref())) {
+        return Err(code::NOT_ALLOWED);
+    }
+    let exe = installed.and_then(|m| m.exe);
+    let windows = crate::install::windows::system_root();
+    if !policy::folder_allowed(app, item.folder.as_deref(), exe.as_deref().and_then(Path::parent), &windows) {
+        return Err(code::FOLDER);
+    }
+    Ok(exe)
+}
+
+/// Whether `item` may go to the elevated helper: this launcher is signed by
+/// [`crate::signing::PUBLISHER`], the MSI by the same signer, and [`vet`] allows it. Asked on the
+/// job's own thread before it joins the installer's queue, so the signature checks never hold
+/// up another install. Anything else installs the way it did before batches, with Windows
+/// Installer's own prompt, which a per-user install with its own folder, say, still needs.
+#[cfg(windows)]
+pub fn batchable(item: &Item) -> bool {
+    let Some(ours) = crate::signing::own_publisher() else { return false };
+    crate::signing::publisher_of(&item.msi).as_ref() == Some(&ours) && vet(item).is_ok()
+}
+
 /// Installs a batch (see the module docs): leaves out apps that are running, asks once, runs the
 /// helper and reads back each MSI's result. `report` hears [`ASKING`], then [`INSTALLING`] once
 /// the helper has started.
 ///
-/// Only MSIs this launcher's own publisher signed, of Craft App releases, in one folder, go to
-/// the helper. When this copy of the launcher isn't signed, or for an MSI that isn't, the MSI
-/// installs the way it did before the batch: `msiexec` asks for permission itself, in Windows
-/// Installer's name, so the launcher's name never vouches for it.
+/// Only [`batchable`] jobs, in one folder, go to the helper. Any other MSI installs the way it did
+/// before batches: `msiexec` asks for permission itself, in Windows Installer's name, so the
+/// launcher's name never vouches for it.
 #[cfg(windows)]
 pub fn install(jobs: &[Job], report: &dyn Fn(u32)) -> Outcomes {
     let mut outcomes: Vec<Option<Result<(), String>>> = jobs
@@ -404,18 +452,9 @@ pub fn install(jobs: &[Job], report: &dyn Fn(u32)) -> Outcomes {
         })
         .collect();
     let pending: Vec<usize> = outcomes.iter().enumerate().filter(|(_, o)| o.is_none()).map(|(at, _)| at).collect();
-    let publisher = signing::own_publisher();
-    if publisher.is_none() {
-        log::info!("this copy of ArtCraft Launcher isn't signed: each install asks for permission itself");
-    }
-    let folder = pending.first().and_then(|at| jobs.get(*at)).and_then(|job| job.item.msi.parent()).map(Path::to_path_buf);
-    let (batch, alone): (Vec<usize>, Vec<usize>) = pending.iter().partition(|at| {
-        jobs.get(**at).is_some_and(|job| {
-            let named = job.item.msi.file_name().and_then(|n| n.to_str()).and_then(policy::craft_msi).is_some();
-            let signed = publisher.as_ref().is_some_and(|ours| signing::publisher_of(&job.item.msi).as_ref() == Some(ours));
-            named && signed && job.item.msi.parent() == folder.as_deref()
-        })
-    });
+    let folder = pending.iter().filter_map(|at| jobs.get(*at)).find(|job| job.batchable).and_then(|job| job.item.msi.parent()).map(Path::to_path_buf);
+    let (batch, alone): (Vec<usize>, Vec<usize>) =
+        pending.iter().partition(|at| jobs.get(**at).is_some_and(|job| job.batchable && job.item.msi.parent() == folder.as_deref()));
     if !batch.is_empty()
         && let Some(folder) = &folder
     {
@@ -484,41 +523,6 @@ fn install_batch(jobs: &[Job], batch: &[usize], folder: &Path, report: &dyn Fn(u
     let _ = std::fs::remove_file(&results);
 }
 
-/// The organization on the code-signing certificate of ArtCraft Launcher and the Craft Apps.
-/// The batch helper installs only MSIs signed by it, and only while the helper itself is.
-pub const KNOWN_PUBLISHER: &str = "Learning Machines LLC";
-
-/// Whether a signature's publisher is [`KNOWN_PUBLISHER`].
-#[cfg(any(windows, test))]
-fn is_known_publisher(organization: Option<&str>) -> bool {
-    organization == Some(KNOWN_PUBLISHER)
-}
-
-/// Authenticode: who signed a file.
-#[cfg(windows)]
-mod signing {
-    use std::path::Path;
-
-    /// The publisher on `file`'s valid Authenticode signature; `None` when it has none, it isn't
-    /// valid, or it names no one.
-    pub fn publisher_of(file: &Path) -> Option<verifysign::Name> {
-        let name = verifysign::verify_file(file).ok()?.subject_name();
-        (name.organization.is_some() || name.common_name.is_some()).then_some(name)
-    }
-
-    /// The publisher that signed this program, when it is [`super::KNOWN_PUBLISHER`]; `None` for
-    /// an unsigned build or anyone else's. Every MSI of a batch must carry this exact signer.
-    pub fn own_publisher() -> Option<verifysign::Name> {
-        let name = publisher_of(&std::env::current_exe().ok()?)?;
-        if super::is_known_publisher(name.organization.as_deref()) {
-            Some(name)
-        } else {
-            log::warn!("this program is signed by {name:?}, not {}: no MSI batches", super::KNOWN_PUBLISHER);
-            None
-        }
-    }
-}
-
 /// Starting the helper with administrator rights, and the helper itself.
 #[cfg(windows)]
 mod elevated {
@@ -529,7 +533,8 @@ mod elevated {
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
-    use super::{Item, Request, code, command_line, helper_args, policy, result_line, signing};
+    use super::{Item, Request, code, command_line, helper_args, result_line, vet};
+    use crate::signing;
 
     /// `FILE_SHARE_READ`: others may read the file while it's open, but not change it.
     const FILE_SHARE_READ: u32 = 0x1;
@@ -670,64 +675,59 @@ mod elevated {
                 return EXIT_RESULTS;
             }
         };
+        // Removed however the helper ends.
         let staging = staging_folder();
         let msiexec = crate::install::windows::msiexec();
         for (index, (item, source)) in request.items.iter().zip(sources).enumerate() {
             let code = match (vet(item), source, &staging) {
-                (Err(code), _, _) | (Ok(()), Err(code), _) => code,
-                (Ok(()), Ok(_), None) => code::NOT_STARTED,
-                (Ok(()), Ok(source), Some(staging)) => install_one(index, item, source, staging, &msiexec, &publisher),
+                (Err(code), _, _) | (Ok(_), Err(code), _) => code,
+                (Ok(_), Ok(_), None) => code::NOT_STARTED,
+                // Looked at again now: the prompt may have been up for a while.
+                (Ok(Some(exe)), Ok(_), Some(_)) if crate::process::is_running(&exe) => code::RUNNING,
+                (Ok(_), Ok(source), Some(staging)) => install_one(index, item, source, &staging.0, &msiexec, &publisher),
             };
             if writeln!(results, "{}", result_line(index, code)).and_then(|()| results.flush()).is_err() {
                 return EXIT_RESULTS;
             }
         }
-        if let Some(staging) = staging {
-            let _ = std::fs::remove_dir_all(staging);
-        }
         EXIT_DONE
     }
 
-    /// Whether `item` is a Craft App release this helper may install, where it's asked to (see
-    /// [`policy`]); the code to report otherwise. Reads only what an administrator controls: the
-    /// machine-wide Windows Installer registrations and the Windows folder from the registry.
-    fn vet(item: &Item) -> Result<(), i32> {
-        let name = item.msi.file_name().and_then(|n| n.to_str()).ok_or(code::NOT_ALLOWED)?;
-        let (app, version) = policy::craft_msi(name).ok_or(code::NOT_ALLOWED)?;
-        let installed = crate::detect::windows::machine_msi_installs(app).into_iter().next();
-        if !policy::not_a_downgrade(&version, installed.as_ref().and_then(|m| m.version.as_ref())) {
-            return Err(code::NOT_ALLOWED);
-        }
-        let installed_folder = installed.as_ref().and_then(|m| m.exe.as_deref()).and_then(Path::parent);
-        let windows = crate::install::windows::system_root();
-        if !policy::folder_allowed(app, item.folder.as_deref(), installed_folder, &windows) {
-            return Err(code::UNSAFE_PATH);
-        }
-        Ok(())
-    }
-
     /// Opens a downloaded MSI so no one can write, rename or delete it while it's open.
-    fn open_source(item: &Item) -> Result<File, i32> {
+    pub fn open_source(item: &Item) -> Result<File, i32> {
         if !plain(&item.msi) {
             return Err(code::UNSAFE_PATH);
         }
         OpenOptions::new().read(true).share_mode(FILE_SHARE_READ).open(&item.msi).map_err(|_| code::NOT_STARTED)
     }
 
-    /// A new folder of this batch's own in the Windows temporary folder, under a random name,
-    /// that only administrators and the system can open: nothing in it can be read, changed or
-    /// added by the user's account. `None` (and nothing staged) when its access can't be set.
-    fn staging_folder() -> Option<PathBuf> {
+    /// The batch's staging folder, removed with everything in it when this goes, however the
+    /// helper ends: what's in it only administrators could clean up.
+    pub struct Staging(pub PathBuf);
+
+    impl Drop for Staging {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A new folder of this batch's own in the Windows temporary folder (see [`staging_in`]).
+    fn staging_folder() -> Option<Staging> {
+        staging_in(&dunce::canonicalize(crate::install::windows::system_root().join("Temp")).ok()?)
+    }
+
+    /// A new folder in `parent`, under a random name, that only administrators and the system
+    /// can open: nothing in it can be read, changed or added by the user's account. `None` (and
+    /// nothing staged) when its access can't be set.
+    pub fn staging_in(parent: &Path) -> Option<Staging> {
         let mut name = [0u8; 16];
         getrandom::fill(&mut name).ok()?;
-        let temp = dunce::canonicalize(crate::install::windows::system_root().join("Temp")).ok()?;
-        let folder = temp.join(format!("artcraft-launcher-msi-{}", crate::http::hex(&name)));
-        std::fs::create_dir(&folder).ok()?;
-        if lock_down(&folder) {
-            Some(folder)
+        let staging = Staging(parent.join(format!("artcraft-launcher-msi-{}", crate::http::hex(&name))));
+        std::fs::create_dir(&staging.0).ok()?;
+        if lock_down(&staging.0) {
+            Some(staging)
         } else {
             log::error!("couldn't restrict the staging folder to administrators");
-            let _ = std::fs::remove_dir_all(&folder);
             None
         }
     }
@@ -735,7 +735,7 @@ mod elevated {
     /// Replaces `folder`'s access list with full control for Administrators and SYSTEM only, for
     /// it and everything created in it, nothing inherited (Windows' own `icacls`, from the folder
     /// the machine's registry names).
-    fn lock_down(folder: &Path) -> bool {
+    pub fn lock_down(folder: &Path) -> bool {
         let icacls = crate::install::windows::system_root().join(r"System32\icacls.exe");
         crate::process::command(icacls)
             .arg(folder)
@@ -800,7 +800,7 @@ mod elevated {
 
     /// Copies `source` into a new file at `staged`, which no one else may open meanwhile, and
     /// returns the lowercase hex SHA-256 of the bytes written.
-    fn stage(source: &mut File, staged: &Path) -> Option<String> {
+    pub fn stage(source: &mut File, staged: &Path) -> Option<String> {
         use sha2::{Digest, Sha256};
         let mut out = OpenOptions::new().write(true).create_new(true).share_mode(0).open(staged).ok()?;
         let mut hasher = Sha256::new();
@@ -906,14 +906,6 @@ mod tests {
     }
 
     #[test]
-    fn only_the_known_publisher_counts() {
-        assert!(is_known_publisher(Some("Learning Machines LLC")));
-        assert!(!is_known_publisher(Some("Learning Machines LLC Evil")));
-        assert!(!is_known_publisher(Some("learning machines llc")), "the certificate's name exactly");
-        assert!(!is_known_publisher(None));
-    }
-
-    #[test]
     fn an_older_release_never_replaces_a_newer_install() {
         let v = |s: &str| artcraft_launcher_core::version::parse(s).unwrap();
         assert!(policy::not_a_downgrade(&v("0.5.0"), None));
@@ -964,7 +956,9 @@ mod tests {
     fn each_result_says_what_happened() {
         let log = abs("d/a.log");
         assert_eq!(explain(Some(0), &log), Ok(()));
-        assert_eq!(explain(Some(3010), &log), Ok(()));
+        assert!(explain(Some(3010), &log).is_err_and(|e| e.contains("restart")), "not called a success while the old files stay");
+        assert!(explain(Some(code::FOLDER), &log).is_err_and(|e| e.contains("install folder")));
+        assert!(explain(Some(code::RUNNING), &log).is_err_and(|e| e.contains("Quit it")));
         assert_eq!(explain(Some(1602), &log), Err(CANCELLED.to_string()));
         assert!(explain(Some(1603), &log).is_err_and(|e| e.contains("1603") && e.contains(&log.display().to_string())));
         assert!(explain(Some(code::CHECKSUM), &log).is_err_and(|e| e.contains("changed")));
@@ -1050,5 +1044,66 @@ mod tests {
         let install = |jobs: &[Job], _: &dyn Fn(u32)| jobs.iter().map(|_| Err(CANCELLED.to_string())).collect();
         let results = run_together(&["PhotoCraft", "FilmCraft"], &install);
         assert!(results.iter().all(|(r, _)| *r == Err(CANCELLED.to_string())), "{results:?}");
+    }
+
+    /// The elevated helper's file handling, on the Windows CI runner (which runs as an
+    /// administrator, like the helper).
+    #[cfg(windows)]
+    mod elevated_files {
+        use super::super::elevated::{lock_down, open_source, stage, staging_in};
+        use super::*;
+
+        #[test]
+        fn a_download_held_for_the_batch_cant_be_changed_renamed_or_deleted() {
+            let dir = tempfile::tempdir().unwrap();
+            let msi = dunce::canonicalize(dir.path()).unwrap().join("photocraft-0.5.0-windows-x64.msi");
+            std::fs::write(&msi, b"package").unwrap();
+            let item = Item { msi: msi.clone(), sha256: sha('a'), folder: None };
+            let held = open_source(&item).unwrap();
+            assert!(std::fs::OpenOptions::new().write(true).open(&msi).is_err(), "written");
+            assert!(std::fs::rename(&msi, msi.with_extension("old")).is_err(), "renamed");
+            assert!(std::fs::remove_file(&msi).is_err(), "deleted");
+            assert!(std::fs::read(&msi).is_ok(), "but still readable");
+            drop(held);
+            assert!(std::fs::remove_file(&msi).is_ok());
+        }
+
+        #[test]
+        fn a_path_through_a_link_isnt_opened() {
+            let dir = tempfile::tempdir().unwrap();
+            let item = Item { msi: dir.path().join("sub").join("..").join("a.msi"), sha256: sha('a'), folder: None };
+            assert_eq!(open_source(&item).err(), Some(code::UNSAFE_PATH));
+        }
+
+        #[test]
+        fn the_staged_copy_is_exactly_the_bytes_hashed() {
+            use sha2::{Digest, Sha256};
+            let dir = tempfile::tempdir().unwrap();
+            let msi = dunce::canonicalize(dir.path()).unwrap().join("photocraft-0.5.0-windows-x64.msi");
+            let body: Vec<u8> = (0..200_000u32).map(|n| (n % 251) as u8).collect();
+            std::fs::write(&msi, &body).unwrap();
+            let mut source = open_source(&Item { msi, sha256: sha('a'), folder: None }).unwrap();
+            let staged = dir.path().join("staged.msi");
+            let sha = stage(&mut source, &staged).unwrap();
+            assert_eq!(sha, crate::http::hex(&Sha256::digest(&body)));
+            assert_eq!(std::fs::read(&staged).unwrap(), body);
+            assert!(stage(&mut source, &staged).is_none(), "never over an existing file");
+        }
+
+        #[test]
+        fn the_staging_folder_is_locked_down_and_goes_however_the_helper_ends() {
+            let dir = tempfile::tempdir().unwrap();
+            let staging = staging_in(&dunce::canonicalize(dir.path()).unwrap()).expect("icacls restricts the folder");
+            let folder = staging.0.clone();
+            assert!(folder.is_dir());
+            std::fs::write(folder.join("left over.msi"), b"package").unwrap();
+            // Not inherited: only what lock_down granted.
+            let acl = std::process::Command::new(crate::install::windows::system_root().join(r"System32\icacls.exe")).arg(&folder).output().unwrap();
+            let acl = String::from_utf8_lossy(&acl.stdout).to_string();
+            assert!(!acl.contains("(I)"), "{acl}");
+            assert!(lock_down(&folder));
+            drop(staging);
+            assert!(!folder.exists(), "removed with what was in it");
+        }
     }
 }

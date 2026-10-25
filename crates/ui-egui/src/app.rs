@@ -120,6 +120,10 @@ pub struct LauncherUi {
     pub(crate) alerts: Vec<artcraft_launcher_core::feed::Notice>,
     pub(crate) search: String,
     pub(crate) toasts: Vec<Toast>,
+    /// The apps (with versions) the system's permission prompt is up for, and the toast that
+    /// lists them, which stays until the prompt is answered.
+    asking_for: Vec<String>,
+    asking_toast: Option<String>,
     pub(crate) dialog: Option<Dialog>,
     /// Release-note text scale for this session, independent of the main UI zoom.
     pub(crate) notes_zoom: f32,
@@ -199,6 +203,8 @@ impl LauncherUi {
             alerts: Vec::new(),
             search: String::new(),
             toasts: Vec::new(),
+            asking_for: Vec::new(),
+            asking_toast: None,
             dialog: None,
             notes_zoom: 1.0,
             detail: None,
@@ -264,6 +270,34 @@ impl LauncherUi {
 
     pub(crate) fn send(&mut self, command: Command) {
         self.backend.send(command);
+    }
+
+    /// While the system's permission prompt is up (Windows' one UAC prompt for a batch of
+    /// installs), says which apps and versions it is for, so answering it is an informed choice.
+    fn announce_permission(&mut self, ctx: &egui::Context) {
+        let asking: Vec<String> = self
+            .entries
+            .iter()
+            .filter(|e| e.job == Some(JobPhase::Elevating))
+            .map(|e| match e.release() {
+                Some(r) => format!("{} {}", e.app.name, r.version_label()),
+                None => e.app.name.to_string(),
+            })
+            .collect();
+        if asking == self.asking_for {
+            return;
+        }
+        if let Some(old) = self.asking_toast.take() {
+            self.toasts.retain(|t| t.text != old);
+        }
+        if !asking.is_empty() {
+            let text = crate::i18n::fmt(tl!("Windows is asking for permission to install: {apps}"), &[("apps", &asking.join(", "))]);
+            let now = ctx.input(|i| i.time);
+            // Until the prompt is answered (the next change clears it).
+            self.toasts.push(Toast { text: text.clone(), error: false, until: now + 24.0 * 3600.0 });
+            self.asking_toast = Some(text);
+        }
+        self.asking_for = asking;
     }
 
     pub(crate) fn toast(&mut self, ctx: &egui::Context, text: impl Into<String>, error: bool) {
@@ -341,6 +375,7 @@ impl LauncherUi {
         for event in self.backend.poll() {
             changed |= self.handle(ctx, event);
         }
+        self.announce_permission(ctx);
         if changed {
             self.announce_updates(host);
             if self.settings.auto_update {

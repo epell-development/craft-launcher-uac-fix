@@ -6,13 +6,15 @@
 //! asked for once.
 //!
 //! A job that will join such a call takes a [`Ticket`] before its download starts. A call waits
-//! while any ticket for its command is still out, so jobs started together (**Update all**) end
-//! up in one call however long each download takes. A job whose download fails, is paused or is
-//! cancelled drops its ticket and leaves the batch.
+//! while a ticket for its command is still out, so jobs started together (**Update all**) end up
+//! in one call. A job whose download fails, is paused or is cancelled drops its ticket and leaves
+//! the batch. The wait is bounded: a ticket whose download hasn't moved for [`QUIET`] (offline,
+//! stalled, reconnecting) no longer holds the call back, and no job that is ready waits more than
+//! [`LONGEST`] for the others. Jobs ready later make a call of their own.
 
 use std::ffi::OsString;
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use artcraft_launcher_core::protocol::CANCELLED;
 
@@ -26,6 +28,11 @@ pub enum Step {
     /// The job's call is under way, at the stage its leader last reported (0 when it starts).
     Running(u32),
 }
+
+/// How long a [`Ticket`] may go without [`Ticket::alive`] before calls stop waiting for it.
+pub const QUIET: Duration = Duration::from_secs(30);
+/// The longest a job that is ready waits for the jobs still downloading.
+pub const LONGEST: Duration = Duration::from_secs(10 * 60);
 
 /// The outcome a job gets when its call ended without saying (the installer died).
 const INTERRUPTED: &str = "the system installer was interrupted";
@@ -47,16 +54,26 @@ struct State<T> {
     /// How far the call in progress has got (see [`Step::Running`]).
     stage: u32,
     finished: Vec<(u64, Outcome)>,
-    /// The command of every [`Ticket`] still out: jobs that will join a call once downloaded.
-    expected: Vec<Vec<OsString>>,
+    /// Every [`Ticket`] still out: jobs that will join a call once downloaded.
+    expected: Vec<Expected>,
+}
+
+/// A job still downloading, and when its download last moved.
+struct Expected {
+    id: u64,
+    command: Vec<OsString>,
+    seen: Instant,
 }
 
 impl<T> State<T> {
-    /// Takes one [`Ticket`] for `command` off the list of expected jobs.
-    fn forget(&mut self, command: &[OsString]) {
-        if let Some(at) = self.expected.iter().position(|c| c == command) {
-            self.expected.swap_remove(at);
-        }
+    /// Takes the [`Ticket`] `id` off the list of expected jobs.
+    fn forget(&mut self, id: u64) {
+        self.expected.retain(|e| e.id != id);
+    }
+
+    /// Whether a call to `command` should still wait for a job that is downloading.
+    fn awaited(&self, command: &[OsString], quiet: Duration) -> bool {
+        self.expected.iter().any(|e| e.command == command && e.seen.elapsed() < quiet)
     }
 }
 
@@ -65,19 +82,35 @@ impl<T> State<T> {
 pub struct Queue<T = OsString> {
     state: Mutex<State<T>>,
     changed: Condvar,
+    /// [`QUIET`], or shorter in tests.
+    quiet: Duration,
+    /// [`LONGEST`], or shorter in tests.
+    longest: Duration,
 }
 
-/// A job that is still downloading and will then join a call to `command` (see the module docs).
-/// Dropping it takes the job out of the batch; [`Queue::batch`] redeems it.
+/// A job that is still downloading and will then join a call to its command (see the module
+/// docs). Dropping it takes the job out of the batch; [`Queue::batch`] redeems it.
 pub struct Ticket<'a, T> {
     queue: &'a Queue<T>,
-    command: Option<Vec<OsString>>,
+    /// `None` once redeemed.
+    id: Option<u64>,
+}
+
+impl<T> Ticket<'_, T> {
+    /// Says the job's download is still moving, so calls keep waiting for it.
+    pub fn alive(&self) {
+        if let Some(id) = self.id
+            && let Some(e) = self.queue.lock().expected.iter_mut().find(|e| e.id == id)
+        {
+            e.seen = Instant::now();
+        }
+    }
 }
 
 impl<T> Drop for Ticket<'_, T> {
     fn drop(&mut self) {
-        if let Some(command) = self.command.take() {
-            self.queue.lock().forget(&command);
+        if let Some(id) = self.id.take() {
+            self.queue.lock().forget(id);
             self.queue.changed.notify_all();
         }
     }
@@ -120,8 +153,13 @@ impl<T> Default for Queue<T> {
 impl<T> Queue<T> {
     /// An empty queue, with the installer free.
     pub const fn new() -> Self {
+        Self::waiting_at_most(QUIET, LONGEST)
+    }
+
+    /// [`Queue::new`], waiting at most `quiet` for a silent download and `longest` in all.
+    pub const fn waiting_at_most(quiet: Duration, longest: Duration) -> Self {
         let state = State { busy: false, next_id: 0, waiting: Vec::new(), running: Vec::new(), stage: 0, finished: Vec::new(), expected: Vec::new() };
-        Self { state: Mutex::new(state), changed: Condvar::new() }
+        Self { state: Mutex::new(state), changed: Condvar::new(), quiet, longest }
     }
 
     /// The queue's state, even after a job panicked while holding it.
@@ -137,8 +175,11 @@ impl<T> Queue<T> {
     /// Says that a job will join a call to `command` once its download is ready. Calls to
     /// `command` wait until the ticket is redeemed by [`Queue::batch`] or dropped.
     pub fn expect(&self, command: Vec<OsString>) -> Ticket<'_, T> {
-        self.lock().expected.push(command.clone());
-        Ticket { queue: self, command: Some(command) }
+        let mut state = self.lock();
+        let id = state.next_id;
+        state.next_id = state.next_id.wrapping_add(1);
+        state.expected.push(Expected { id, command, seen: Instant::now() });
+        Ticket { queue: self, id: Some(id) }
     }
 
     /// Runs `work` once no other installer is running. `turn(true)` says it has to wait,
@@ -201,10 +242,11 @@ impl<T> Queue<T> {
         // Joining the queue and redeeming the ticket happen together, so no call can start in
         // between and miss this job.
         if let Some(mut ticket) = ticket
-            && let Some(expected) = ticket.command.take()
+            && let Some(expected) = ticket.id.take()
         {
-            state.forget(&expected);
+            state.forget(expected);
         }
+        let ready = Instant::now();
         let (mut waited, mut told) = (false, None);
         loop {
             if let Some(at) = state.finished.iter().position(|(done, _)| *done == id) {
@@ -216,7 +258,8 @@ impl<T> Queue<T> {
                 state.waiting.retain(|w| w.id != id);
                 return Err(CANCELLED.into());
             }
-            if !running && !state.busy && !state.expected.contains(&command) {
+            // Waiting for the others' downloads is bounded (see the module docs).
+            if !running && !state.busy && (ready.elapsed() >= self.longest || !state.awaited(&command, self.quiet)) {
                 break;
             }
             let tell = if running {
@@ -756,5 +799,37 @@ mod tests {
         let mut ends: Vec<Option<Step>> = (0..3).map(last).collect();
         ends.sort_by_key(|s| format!("{s:?}"));
         assert_eq!(ends, [Some(Step::Running(0)), Some(Step::Running(1)), Some(Step::Running(1))], "{heard:?}");
+    }
+
+    #[test]
+    fn a_download_that_has_gone_quiet_stops_holding_the_batch_back() {
+        let queue: Queue = Queue::waiting_at_most(Duration::from_millis(300), Duration::from_secs(60));
+        let _stalled = queue.expect(install());
+        let started = Instant::now();
+        assert_eq!(queue.batched(install(), os("a.deb"), &|| false, &mut |_| {}, &|_, _| Ok(())), Ok(()));
+        let waited = started.elapsed();
+        assert!(waited >= Duration::from_millis(250) && waited < Duration::from_secs(5), "{waited:?}");
+    }
+
+    #[test]
+    fn a_download_that_keeps_moving_is_waited_for_up_to_the_limit() {
+        let queue: Queue = Queue::waiting_at_most(Duration::from_millis(200), Duration::from_millis(900));
+        let moving = queue.expect(install());
+        let done = AtomicBool::new(false);
+        let started = Instant::now();
+        std::thread::scope(|scope| {
+            let (moving, done) = (&moving, &done);
+            scope.spawn(move || {
+                while !done.load(Ordering::SeqCst) {
+                    moving.alive();
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            });
+            assert_eq!(queue.batched(install(), os("a.deb"), &|| false, &mut |_| {}, &|_, _| Ok(())), Ok(()));
+            done.store(true, Ordering::SeqCst);
+        });
+        let waited = started.elapsed();
+        assert!(waited >= Duration::from_millis(850), "still moving, so it waited for it: {waited:?}");
+        assert!(waited < Duration::from_secs(5), "but no longer than the limit: {waited:?}");
     }
 }

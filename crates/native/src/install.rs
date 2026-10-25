@@ -91,9 +91,27 @@ pub fn install_at(
     }
     log::info!("{}: starting {} to {} ({})", app.name, if existing.is_some() { "update" } else { "install" }, release.version_label(), kind.label());
     // Said before the download starts, so MSIs started together (Update all) install together,
-    // behind one permission prompt, however long each download takes.
+    // behind one permission prompt. While the download moves it keeps the batch waiting for it;
+    // a stalled one stops holding the others back (`crate::queue`).
     #[cfg(windows)]
     let ticket = (kind == PackageKind::Msi).then(windows::ticket);
+    #[cfg(windows)]
+    #[allow(unused_variables)]
+    let (file, sha256) = {
+        let (http, paths, stop, install_locations, replace) = (job.http, job.paths, job.stop, job.install_locations, job.replace);
+        let phase = &mut *job.phase;
+        let mut moving = |p: JobPhase| {
+            if matches!(p, JobPhase::Downloading { .. } | JobPhase::Verifying)
+                && let Some(ticket) = &ticket
+            {
+                ticket.alive();
+            }
+            phase(p);
+        };
+        let mut downloading = Job { http, paths, stop, phase: &mut moving, install_locations, replace };
+        download_verified(release, asset, &mut downloading)?
+    };
+    #[cfg(not(windows))]
     #[allow(unused_variables)]
     let (file, sha256) = download_verified(release, asset, job)?;
     log::info!("{}: download ready ({}), running installer...", app.name, file.display());
@@ -1661,7 +1679,10 @@ pub mod windows {
         phase: &mut dyn FnMut(JobPhase),
         ticket: Option<Ticket<'static, msi_batch::Job>>,
     ) -> Result<(), String> {
-        let job = msi_batch::Job::new(msi.app, msi.file, msi.sha256, msi.destination, msi.running)?;
+        let mut job = msi_batch::Job::new(msi.app, msi.file, msi.sha256, msi.destination, msi.running)?;
+        // Signatures and the registry are read here, on this job's thread, before it joins the
+        // queue: never while another install waits for its turn.
+        job.batchable = msi_batch::batchable(&job.item);
         msi_batch::join(&INSTALLER, ticket, job, stop, phase, &msi_batch::install)
     }
 

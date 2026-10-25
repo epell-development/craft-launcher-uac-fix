@@ -639,6 +639,18 @@ fn an_install_waiting_for_another_says_so_and_can_be_cancelled() {
 }
 
 #[test]
+fn the_permission_prompt_names_every_app_and_version_it_is_for() {
+    let mut ev = events();
+    // Windows' one UAC prompt is up for a batch of two updates.
+    ev.push(Event::Progress { app: "photocraft".into(), phase: JobPhase::Elevating });
+    ev.push(Event::Progress { app: "effectcraft".into(), phase: JobPhase::Elevating });
+    let (mut h, _) = harness_with(ev, ViewMode::Grid, egui::Theme::Dark, true, 1.0);
+    h.run_steps(6);
+    assert!(h.query_all_by_label("Waiting for permission…").count() >= 1);
+    h.get_by_label("Windows is asking for permission to install: PhotoCraft 0.5.0, EffectCraft 0.6.0");
+}
+
+#[test]
 fn the_launcher_update_waiting_for_other_installs_can_be_cancelled() {
     let mut ev = events();
     ev.push(Event::LauncherUpdate(release("artcraft-launcher", "0.2.0", NOW)));
