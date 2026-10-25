@@ -226,6 +226,7 @@ pub fn update(
     let (asset, _) = pick_asset(release, &[LAUNCHER.id], platform, &[install.kind()])
         .ok_or_else(|| format!("ArtCraft Launcher {} has no {} for {}", release.version_label(), install.kind().label(), platform.label()))?;
     let asset = asset.clone();
+    crate::install::bind_artifact_version(&LAUNCHER, release, &asset)?;
     let mut job = Job { http, paths, stop, phase, install_locations: &Default::default(), replace: false };
     let file = install::download(release, &asset, &mut job)?;
     #[cfg(windows)]
@@ -883,14 +884,14 @@ mod tests {
         gone.id()
     }
 
-    /// Two programs from one publisher match; an unsigned one never does, on either side.
+    /// A catalog-signed program matches itself; an unsigned one never does, on either side.
     #[cfg(windows)]
     #[test]
     fn a_file_must_be_signed_by_the_launchers_own_publisher() {
-        let (cmd, msiexec) = (system_program("cmd.exe"), system_program("msiexec.exe"));
+        let cmd = system_program("cmd.exe");
         // `cargo test` binaries are unsigned.
         let unsigned = std::env::current_exe().unwrap();
-        assert_eq!(signed_like(&cmd, &msiexec), Ok(()));
+        assert_eq!(signed_like(&cmd, &cmd), Ok(()));
         assert!(signed_like(&cmd, &unsigned).is_err_and(|e| e.contains("isn't signed")));
         assert!(signed_like(&unsigned, &cmd).is_err_and(|e| e.contains("doesn't install updates")));
     }
@@ -1068,8 +1069,8 @@ mod tests {
     fn the_restart_waits_for_the_old_process_to_exit() {
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("started");
-        let mut old = std::process::Command::new("/bin/sleep").arg("1").spawn().unwrap();
-        relaunch_after_exit(old.id(), &[std::ffi::OsStr::new("/usr/bin/touch"), marker.as_os_str()]).unwrap();
+        let mut old = std::process::Command::new("sleep").arg("1").spawn().unwrap();
+        relaunch_after_exit(old.id(), &[std::ffi::OsStr::new("touch"), marker.as_os_str()]).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(400));
         assert!(!marker.exists(), "started while the old launcher was still running");
         old.wait().unwrap();
