@@ -562,7 +562,6 @@ mod elevated {
             Some(_) => return code::CHECKSUM,
             None => return code::NOT_STARTED,
         }
-        drop(source);
         // Held while msiexec reads it: no one may change it in the meantime.
         let Ok(held) = OpenOptions::new().read(true).share_mode(FILE_SHARE_READ).open(&staged) else { return code::NOT_STARTED };
         let staged_log = folder.join("install.log");
